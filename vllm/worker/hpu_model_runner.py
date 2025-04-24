@@ -99,7 +99,7 @@ class VisionBuckets():
             #TODO:with profile_run, the bucket of 65536 is added, so the pixel values
             #bigger than 12800 below always padded to 65536 which is too big.
             #self.multimodal_buckets = [1600, 3136, 4096, 6400, 7744, 9216, 12544, 16384, 26500, 40000, 65536]
-            multimodal_buckets = [1600, 3136, 4096, 6400, 7744, 9216, 12544]
+            multimodal_buckets = [576, 1024, 1600, 3136, 4096, 6400, 7744, 9216, 12544, 33856]
         else:
             multimodal_buckets = [int(i) for i in envvar.split(',')]
         self.multimodal_buckets = sorted(multimodal_buckets)
@@ -2378,6 +2378,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                       starting_mem=0,
                       total_batch_seq=0.001):
 
+        print("total_batch_seq : ", total_batch_seq)
         if is_prompt and supports_multimodal(self.get_model()) and is_prompt:
             multimodal_prompt_graph_mem_ratio = float(
                 os.environ.get('VLLM_GRAPH_MULTIMODAL_PROMPT_RATIO', '0.3'))
@@ -2389,8 +2390,6 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                 f"{format_bytes(available_mem)} for text prompt "
                 f"(VLLM_GRAPH_MULTIMODAL_PROMPT_RATIO={multimodal_prompt_graph_mem_ratio})")
             logger.info(msg)
-        else:
-            multimodal_avail_mem = 0
 
         total_mem = starting_mem
         idx = 0
@@ -2412,6 +2411,10 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             # Graph memory usage is proportional to seq dimension in a batch
             batch_seq = batch_size * seq_len if is_prompt else batch_size
             mem_estimate = batch_seq / total_batch_seq * total_mem
+            #batch_size {batch_size}, seq_len {seq_len}
+
+            print(f"batch_seq {batch_seq} batch_size {batch_size} * seq_len {seq_len}")
+            print(f"mem_estimate {format_bytes(mem_estimate)} : batch_seq {batch_seq} / total_batch_seq {total_batch_seq} * total_mem {format_bytes(total_mem)}")
             if mem_estimate >= available_mem:
                 captured_all = False
                 continue
@@ -2435,18 +2438,22 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             available_mem -= used_mem
             total_mem += used_mem
             total_batch_seq += batch_seq
+            print(f"used_mem {format_bytes(used_mem)}, available_mem {format_bytes(available_mem)} total_batch_seq : ", total_batch_seq)
 
-        mm_outputs = \
-        self._warmup_multimodal_graph(
-            kv_caches=kv_caches,
-            available_mem=multimodal_avail_mem,
-            starting_mem=0,
-            total_batch_seq=total_batch_seq,
-        )
+        if is_prompt:
+            mm_outputs = \
+            self._warmup_multimodal_graph(
+                kv_caches=kv_caches,
+                available_mem=multimodal_avail_mem,
+                starting_mem=0,
+                total_batch_seq=0.001,
+            )
 
-        if mm_outputs is not None:
-            total_mem, total_batch_seq, mm_captured_all = mm_outputs
-            captured_all = captured_all and mm_captured_all
+            if mm_outputs is not None:
+                mm_total_mem, total_batch_seq, mm_captured_all = mm_outputs
+                total_mem = total_mem + mm_total_mem
+                captured_all = captured_all and mm_captured_all
+
         return total_mem, total_batch_seq, captured_all
 
     def _warmup_multimodal_graph(self,
@@ -2468,6 +2475,8 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             batch_seq = 1 * num_patches
             # Graph memory usage is proportional to seq dimension in a batch
             mem_estimate = batch_seq / total_batch_seq * total_mem
+            print(f"batch_seq {batch_seq} =  batch_size 1 * num_patches {num_patches}")
+            print(f"mem_estimate {format_bytes(mem_estimate)} : batch_seq {batch_seq} / total_batch_seq {total_batch_seq} * total_mem {format_bytes(total_mem)}")
             if mem_estimate >= available_mem:
                 captured_all = False
                 continue
@@ -2490,6 +2499,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             available_mem -= used_mem
             total_mem += used_mem
             total_batch_seq += batch_seq
+            print(f"used_mem {format_bytes(used_mem)}, available_mem {format_bytes(available_mem)} total_batch_seq : ", total_batch_seq)
 
         return total_mem, total_batch_seq, captured_all
 
