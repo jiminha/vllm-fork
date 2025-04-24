@@ -2378,19 +2378,6 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                       starting_mem=0,
                       total_batch_seq=0.001):
 
-        print("total_batch_seq : ", total_batch_seq)
-        if is_prompt and supports_multimodal(self.get_model()) and is_prompt:
-            multimodal_prompt_graph_mem_ratio = float(
-                os.environ.get('VLLM_GRAPH_MULTIMODAL_PROMPT_RATIO', '0.3'))
-            multimodal_avail_mem = (multimodal_prompt_graph_mem_ratio *
-                                    available_mem)
-            available_mem = (available_mem - multimodal_avail_mem)
-            msg = (
-                f"Using {format_bytes(multimodal_avail_mem)} for multimodal prompt and "
-                f"{format_bytes(available_mem)} for text prompt "
-                f"(VLLM_GRAPH_MULTIMODAL_PROMPT_RATIO={multimodal_prompt_graph_mem_ratio})")
-            logger.info(msg)
-
         total_mem = starting_mem
         idx = 0
         phase = f'Graph/{"Prompt" if is_prompt else "Decode"}'
@@ -2440,29 +2427,15 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             total_batch_seq += batch_seq
             print(f"used_mem {format_bytes(used_mem)}, available_mem {format_bytes(available_mem)} total_batch_seq : ", total_batch_seq)
 
-        if is_prompt:
-            mm_outputs = \
-            self._warmup_multimodal_graph(
-                kv_caches=kv_caches,
-                available_mem=multimodal_avail_mem,
-                starting_mem=0,
-                total_batch_seq=0.001,
-            )
-
-            if mm_outputs is not None:
-                mm_total_mem, total_batch_seq, mm_captured_all = mm_outputs
-                total_mem = total_mem + mm_total_mem
-                captured_all = captured_all and mm_captured_all
-
         return total_mem, total_batch_seq, captured_all
 
-    def _warmup_multimodal_graph(self,
+    def warmup_multimodal_graph(self,
                                  kv_caches,
                                  available_mem,
                                  starting_mem=0,
                                  total_batch_seq=0.001):
         if not supports_multimodal(self.get_model()):
-            return None
+            return (0,0,True)
         total_mem = starting_mem
         idx = 0
         phase = f'Graph/Multimodal'
@@ -2613,10 +2586,33 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                         f"{format_bytes(decode_available_memory)} for decode "
                         f"(VLLM_GRAPH_PROMPT_RATIO={prompt_graph_mem_ratio})")
                     logger.info(msg)
+
+                    multimodal_avail_mem=0
+                    if supports_multimodal(self.get_model()):
+                        multimodal_prompt_graph_mem_ratio = float(
+                            os.environ.get('VLLM_GRAPH_MULTIMODAL_PROMPT_RATIO', '0.3'))
+                        multimodal_avail_mem = (multimodal_prompt_graph_mem_ratio *
+                                                prompt_available_memory)
+                        prompt_available_memory = (prompt_available_memory - multimodal_avail_mem)
+                        msg = (
+                            f"Using {format_bytes(multimodal_avail_mem)} for multimodal prompt and "
+                            f"{format_bytes(prompt_available_memory)} for text prompt "
+                            f"(VLLM_GRAPH_MULTIMODAL_PROMPT_RATIO={multimodal_prompt_graph_mem_ratio})")
+                        logger.info(msg)
+
                     mem_post_prompt, prompt_batch_seq, prompt_captured_all = \
                         self.warmup_graphs(
                         prompt_strategy, self.bucketing_ctx.prompt_buckets,
                         True, kv_caches, prompt_available_memory)
+
+                    print("warup text = mem_post_prompt")
+                    mm_mem_post_prompt, mm_prompt_batch_seq, mm_prompt_captured_all = \
+                        self.warmup_multimodal_graph(
+                                    kv_caches=kv_caches,
+                                    available_mem=multimodal_avail_mem,
+                                    starting_mem=0,
+                                )
+                    print("warup multimodal = mm_mem_post_prompt")
 
                     decode_strategy = os.environ.get(
                         'VLLM_GRAPH_DECODE_STRATEGY', 'max_bs')
@@ -2629,7 +2625,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                     # buckets were captured and we have some free
                     # graph-allocated space left. Let's try to use it for
                     # capturing more prompt buckets.
-                    if (mem_post_decode + mem_post_prompt < graph_free_mem
+                    if (mem_post_decode + mm_mem_post_prompt + mem_post_prompt < graph_free_mem
                             and not prompt_captured_all
                             and decode_captured_all):
                         mem_post_prompt, _, prompt_captured_all = (
@@ -2637,21 +2633,34 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                                 prompt_strategy,
                                 self.bucketing_ctx.prompt_buckets, True,
                                 kv_caches, graph_free_mem - mem_post_prompt -
-                                mem_post_decode, mem_post_prompt,
+                                mem_post_decode - mm_mem_post_prompt, mem_post_prompt,
                                 prompt_batch_seq))
-                        # Not all decode buckets were captured, but all prompt
-                        # buckets were captured and we have some free
-                        # graph-allocated space left. Let's try to use it for
-                        # capturing more decode buckets.
-                        if mem_post_decode + mem_post_prompt < graph_free_mem \
-                            and not decode_captured_all \
-                                and prompt_captured_all:
-                            mem_post_decode, _, _ = self.warmup_graphs(
-                                decode_strategy,
-                                self.bucketing_ctx.decode_buckets, False,
-                                kv_caches, graph_free_mem - mem_post_prompt -
-                                mem_post_decode, mem_post_decode,
-                                decode_batch_seq)
+
+                    if (mem_post_decode + mm_mem_post_prompt + mem_post_prompt < graph_free_mem
+                            and not mm_prompt_captured_all
+                            and decode_captured_all):
+                        mm_mem_post_prompt, _, mm_prompt_captured_all = (
+                            self.warmup_multimodal_graph(
+                                kv_caches=kv_caches,
+                                available_mem=graph_free_mem  - mem_post_prompt -
+                                mem_post_decode - mm_mem_post_prompt,
+                                starting_mem=mm_mem_post_prompt,
+                                total_batch_seq=mm_prompt_batch_seq,
+                            ))
+
+                    # Not all decode buckets were captured, but all prompt
+                    # buckets were captured and we have some free
+                    # graph-allocated space left. Let's try to use it for
+                    # capturing more decode buckets.
+                    if mem_post_decode + mm_mem_post_prompt + mem_post_prompt < graph_free_mem \
+                        and not decode_captured_all \
+                            and prompt_captured_all:
+                        mem_post_decode, _, _ = self.warmup_graphs(
+                            decode_strategy,
+                            self.bucketing_ctx.decode_buckets, False,
+                            kv_caches, graph_free_mem - mem_post_prompt -
+                            mem_post_decode - mm_mem_post_prompt, mem_post_decode,
+                            decode_batch_seq)
                 else:
                     prompt_available_memory = graph_free_mem
                     msg = (
@@ -2667,6 +2676,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                         self.warmup_graphs(
                         prompt_strategy, self.bucketing_ctx.prompt_buckets,
                         True, kv_caches, prompt_available_memory)
+                    
                     if mem_post_prompt < graph_free_mem \
                         and not prompt_captured_all:
                         mem_post_prompt, _, prompt_captured_all = (
