@@ -136,6 +136,12 @@ class HPUAttentionMetadata(HPUPagedAttentionMetadata, AttentionMetadata):
     cross_block_groups: Optional[torch.Tensor] = None
     cross_block_usage: Optional[torch.Tensor] = None
     cross_attn_bias: Optional[torch.Tensor] = None
+    window_block_list: Optional[torch.Tensor] = None
+    window_slot_mapping: Optional[torch.Tensor] = None
+    window_block_mapping: Optional[torch.Tensor] = None
+    window_block_groups: Optional[torch.Tensor] = None
+    window_block_usage: Optional[torch.Tensor] = None
+    window_attn_bias: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -530,31 +536,31 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
             output = out.reshape(batch_size, seq_len, hidden_size)
         else:
             # Decoding run.
-            block_groups = attn_metadata.block_groups
-            block_mapping = attn_metadata.block_mapping
-            block_list = attn_metadata.block_list
-            attn_bias= attn_metadata.attn_bias
+            block_list = attn_metadata.block_list if not self.sliding_window else attn_metadata.window_block_list
+            block_groups = attn_metadata.block_groups if not self.sliding_window else attn_metadata.window_block_groups
+            block_mapping = attn_metadata.block_mapping if not self.sliding_window else attn_metadata.window_block_mapping
+            attn_bias = attn_metadata.attn_bias if not self.sliding_window else attn_metadata.window_attn_bias
 
-            if self.sliding_window:
-                block_size = len(attn_metadata.block_groups)
-                window_block = (self.sliding_window // block_size)
-                valid_block = (attn_metadata.block_groups == 0).sum()
+            #TODO: These are for test accuracy
+            #block_list =attn_metadata.block_list
+            #block_groups = attn_metadata.block_groups
+            #block_mapping =  attn_metadata.block_mapping
+            #attn_bias =  attn_metadata.attn_bias
 
-                # Create a mask to retain elements within the sliding window and exclude others.
-                rng = torch.arange(block_size, device='hpu')
-                mask = torch.logical_and(rng > 0, rng < valid_block-window_block+1)
+            #block_list =attn_metadata.window_block_list
+            #block_groups = attn_metadata.window_block_groups
+            #block_mapping =  attn_metadata.window_block_mapping
+            #attn_bias =  attn_metadata.window_attn_bias
 
-                block_groups= torch.where(mask,  torch.tensor(-1), attn_metadata.block_groups)
-                block_mapping=  torch.where(mask.unsqueeze(1), torch.tensor(0.0), attn_metadata.block_mapping)
-                block_list= torch.where(mask,  torch.tensor(0), attn_metadata.block_list)
-
+            # Decoding run.
             output = HPUPagedAttention.forward_decode(
                 query=query,
                 block_mapping=block_mapping,
                 block_bias=attn_bias,
                 block_groups=block_groups,
                 **self.common_attention_args(block_list,
-                                             key_cache, value_cache, attn_metadata.block_size))
+                                             key_cache, value_cache,
+                                             attn_metadata.block_size))
 
         # Reshape the output tensor.
         return output.view(batch_size, seq_len, hidden_size)
