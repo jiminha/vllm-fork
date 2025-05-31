@@ -536,7 +536,7 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
             attn_bias= attn_metadata.attn_bias
 
             if self.sliding_window:
-                block_size = len(attn_metadata.block_groups)
+                block_size = attn_metadata.block_size
                 window_block = (self.sliding_window // block_size)
                 valid_block = (attn_metadata.block_groups == 0).sum()
 
@@ -544,9 +544,57 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
                 rng = torch.arange(block_size, device='hpu')
                 mask = torch.logical_and(rng > 0, rng < valid_block-window_block+1)
 
+
+                ## THIS WORKS FOR BATCH 1 ONLY.
+                '''
                 block_groups= torch.where(mask,  torch.tensor(-1), attn_metadata.block_groups)
                 block_mapping=  torch.where(mask.unsqueeze(1), torch.tensor(0.0), attn_metadata.block_mapping)
                 block_list= torch.where(mask,  torch.tensor(0), attn_metadata.block_list)
+                '''
+
+                ## MASK CREATION 1 - TEMPORARY
+                x=attn_metadata.block_groups.to('cpu')
+                mask_nxn = x.unsqueeze(0) == torch.arange(0,x.shape[0]).unsqueeze(1)
+                num_elems_per_batch = torch.sum((x.unsqueeze(0) == torch.arange(0,x.shape[0]).unsqueeze(1)), dim=1)
+                x = num_elems_per_batch.numpy()
+                out = [False]
+                for i in x:
+                    num_true = min(window_block, i)
+                    num_false = i - num_true
+                    lst = [False] * num_false + [True] * num_true
+                    print(lst)
+                    out += lst
+                out += ([False] * (x.shape[0] - len(out)))
+                #print(torch.tensor(out))
+                mask = torch.tensor(out).to("hpu")
+
+                ## MASK CREATION 2 - TEMPORARY
+                '''
+                x=attn_metadata.block_groups
+                unique_batches, counts = torch.unique(x[x >= 0], return_counts=True)
+                mask = torch.zeros(block_size, dtype=torch.bool).to('hpu')
+
+                current_index = 0
+                for batch_id, count in zip(unique_batches, counts):
+                    start_index = max(0, current_index + count - window_block)
+                    mask[start_index:current_index + count] = True
+                    current_index += count
+                #print(mask)
+                '''
+                block_groups= torch.where(mask,  torch.tensor(-1), attn_metadata.block_groups)
+                block_list= torch.where(mask,  torch.tensor(0), attn_metadata.block_list)
+                block_usage= torch.where(mask,  torch.tensor(0), attn_metadata.block_usage)
+
+                # TODO: I think this might be wrong calculation here. We will need to check how it was calculated in _set_block_mapping()
+                block_mapping=  torch.where(mask.unsqueeze(1).expand(-1, block_mapping.size(1)), torch.tensor(0.0), attn_metadata.block_mapping)
+
+                mask = torch.arange(0,
+                                    block_size,
+                                    device="hpu",
+                                    dtype=torch.int32).unsqueeze(0)
+                mask = mask >= block_usage.unsqueeze(-1)
+                attn_bias = (torch.zeros_like(mask, dtype=torch.bfloat16).masked_fill_(
+                    mask, -math.inf))
 
             output = HPUPagedAttention.forward_decode(
                 query=query,
