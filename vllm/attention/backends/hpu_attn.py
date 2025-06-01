@@ -505,6 +505,17 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
             block_list = attn_metadata.block_list if attn_metadata \
                 and attn_metadata.block_list is not None else None
 
+            common_args = self.common_attention_args(block_list, key_cache,
+                                             value_cache, attn_metadata.block_size)
+
+            #TODO: Ideally we want to create this sliding_window_bias mask only
+            #once in the model_runner or gemma model file then only retrieve here.
+            if self.sliding_window:
+                attn_bias = _make_sliding_window_bias(batch_size, seq_len,
+                       attn_metadata.seq_lens_tensor,
+                       self.sliding_window, query.dtype)
+                common_args['pad'] = 'left'
+
             out = ops.prompt_attention(
                 impl=self.prefill_impl,
                 query=query.view(query_shape),
@@ -513,9 +524,8 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
                 is_causal=True,
                 attn_bias=attn_bias,
                 valid_seq_lengths=attn_metadata.seq_lens_tensor,
-                **self.common_attention_args(block_list, key_cache,
-                                             value_cache,
-                                             attn_metadata.block_size))
+                **common_args)
+
             output = out.reshape(batch_size, seq_len, hidden_size)
         else:
             # Decoding run.
@@ -668,3 +678,38 @@ def _make_alibi_bias(
     if num_heads != num_kv_heads:
         bias = bias.unflatten(1, (num_kv_heads, num_heads // num_kv_heads))
     return bias
+
+def _make_sliding_window_bias(
+    batch_size: int,
+    seq_len: int,
+    query_lens_t: torch.tensor,
+    window_size:int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+
+    shift = 0
+    device = query_lens_t.device
+
+    # TODO: this is not performant as of now. Need to investigate further
+    # once FusedSDPA kernel with sliding causal mask support is available.
+
+    # causal + sliding window (LEFT PADDING)
+    tensor = torch.full((batch_size, 1, seq_len, seq_len), device=device,dtype=dtype, fill_value=1)
+    mask = torch.tril(tensor, diagonal=shift)
+    mask = torch.triu(mask, diagonal=shift - window_size + 1)
+    attn_bias = torch.log(mask)
+
+    '''
+    # TODO Accuracy issue need to be debugged.
+    # causal + sliding window + query_len (LEFT PADDING : Need kernel supports)
+    tensor = torch.full((batch_size, 1, seq_len, seq_len), device=device,dtype=dtype,fill_value=1)
+    mask = torch.tril(tensor, diagonal=shift)
+    len_mask = torch.arange(0, seq_len, device=device, dtype=torch.int32).view(seq_len,1)
+    len_mask = len_mask.ge(query_lens_t.unsqueeze(-1)).view(batch_size, 1, seq_len, 1)
+    len_mask = torch.where(len_mask == False, 1, 0)
+    mask = mask.logical_and(len_mask)
+    mask = torch.triu(mask, diagonal=shift - window_size + 1)
+    attn_bias =torch.where(mask,0, -math.inf)
+    '''
+
+    return attn_bias

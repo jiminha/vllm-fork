@@ -1534,8 +1534,13 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                 lora_index_mapping.append(lora_id)
                 lora_prompt_mapping.append(lora_id)
 
-                if self.sliding_window is not None:
-                    sliding_window_blocks = (self.sliding_window //
+                #TODO For interleaved sliding_window, move to outside of here
+                #once batch accuracy issue is fixed.
+                sliding_window = self.model_config.hf_text_config.interleaved_sliding_window
+                if (self.sliding_window is not None) or (
+                 self.model_config.hf_text_config.interleaved_sliding_window is not None):
+                    sliding_window = self.sliding_window if self.sliding_window is not None else self.model_config.hf_text_config.interleaved_sliding_window
+                    sliding_window_blocks = (sliding_window //
                                              self.block_size)
                     block_table = block_table[-sliding_window_blocks:]
                 block_tables.append(block_table)
@@ -2063,6 +2068,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                                      lora_request=lora_request)
 
     def profile_run(self) -> None:
+        return True
         num_layers = self.model_config.get_num_layers(self.parallel_config)
         kv_caches = [None] * num_layers
         bind_kv_cache(
