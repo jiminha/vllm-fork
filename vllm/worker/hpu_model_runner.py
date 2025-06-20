@@ -415,7 +415,7 @@ class HpuModelAdapter(torch.nn.Module):
                                                 seq_len, device, dtype)
         else:
             attn_metadata = self._set_block_mapping(attn_metadata, batch_size,
-                                                    device, dtype, 
+                                                    device, dtype,
                                                     False)
             if attn_metadata.window_block_list is not None:
                 attn_metadata = self._set_block_mapping(attn_metadata, batch_size,
@@ -1577,7 +1577,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                     block_table = block_table[-sliding_window_blocks:]
                 block_tables.append(block_table)
 
-                #TODO: There are many places which checks this config parameter, however this is 
+                #TODO: There are many places which checks this config parameter, however this is
                 #very specific config to gemma3, we should first check if this parameter even exist before check.
                 if self.model_config.hf_text_config.interleaved_sliding_window is not None:
                     sliding_window_blocks = (self.model_config.hf_text_config.interleaved_sliding_window //
@@ -1688,7 +1688,8 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         if self.model_config.hf_text_config.interleaved_sliding_window is not None:
             window_block_list = window_padding_fn(window_block_list, _PAD_BLOCK_ID)
             window_block_groups = window_padding_fn(window_block_groups, -1)
-            window_block_usage = window_padding_fn(window_block_usage, 1)
+            #window_block_usage = window_padding_fn(window_block_usage, 1)
+            window_block_usage = [1 if i == 0 else block_usage[idx] for idx, (i, j) in enumerate(zip(window_block_list, block_usage))]
 
         if is_enc_dec_model:
             if self.use_contiguous_pa:
