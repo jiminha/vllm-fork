@@ -497,15 +497,9 @@ class HpuModelAdapter(torch.nn.Module):
         attn_metadata = prefill_metadata._replace(window_attn_bias=attn_bias)
         return attn_metadata
 
-    def _set_block_mapping(self, metadata, batch_size, device, dtype,
-                           is_window_block):
-        if is_window_block:
-            block_usage = metadata.window_block_usage
-            block_groups = metadata.window_block_groups
-        else:
-            block_usage = metadata.block_usage
-            block_groups = metadata.block_groups
-
+    def _set_block_mapping(self, metadata, batch_size, device, dtype):
+        block_usage = metadata.block_usage
+        block_groups = metadata.block_groups
         mask = torch.arange(0,
                             self.block_size,
                             device=device,
@@ -514,9 +508,15 @@ class HpuModelAdapter(torch.nn.Module):
         attn_bias = (torch.zeros_like(mask, dtype=dtype).masked_fill_(
             mask, -math.inf))
 
+        window_block_mapping = None
         if not is_fake_hpu():
             block_mapping = torch.nn.functional.one_hot(block_groups,
                                                         num_classes=batch_size)
+            if hasattr(metadata, 'window_block_groups'
+                ) and metadata.window_block_groups is not None:
+                window_block_mapping = torch.nn.functional.one_hot(
+                    metadata.window_block_groups, num_classes=batch_size)
+
         else:
             # Unfortunately one_hot on CPU
             # doesn't handle out of bounds classes so we need to convert
@@ -528,26 +528,21 @@ class HpuModelAdapter(torch.nn.Module):
             oob_values = block_groups.lt(0)
             block_mapping.masked_fill_(oob_values.unsqueeze(-1), 0)
             block_groups.masked_fill_(oob_values, batch_size)
-            if is_window_block:
-                metadata = custom_tuple_replace(
-                    metadata,
-                    "TrimmedAttentionMetadata",
-                    window_block_groups=block_groups)
-            else:
-                metadata = custom_tuple_replace(metadata,
-                                                "TrimmedAttentionMetadata",
-                                                block_groups=block_groups)
+
+            if hasattr(attn_metadata, 'window_block_groups'
+                ) and attn_metadata.window_block_groups is not None:
+                # Reset entire rows where window_block_groups is -1
+                window_block_mapping = block_mapping.clone()
+                window_block_mapping[metadata.window_block_groups == -1] = 0
+
         block_mapping = block_mapping.to(dtype)
-        if is_window_block:
-            metadata = custom_tuple_replace(metadata,
-                                            "TrimmedAttentionMetadata",
-                                            window_block_mapping=block_mapping,
-                                            window_attn_bias=attn_bias)
-        else:
-            metadata = custom_tuple_replace(metadata,
-                                            "TrimmedAttentionMetadata",
-                                            block_mapping=block_mapping,
-                                            attn_bias=attn_bias)
+        window_block_mapping = window_block_mapping.to(dtype)
+        metadata = custom_tuple_replace(metadata,
+                                        "TrimmedAttentionMetadata",
+                                        block_groups=block_groups,
+                                        block_mapping=block_mapping,
+                                        attn_bias=attn_bias,
+                                        window_block_mapping=window_block_mapping)
         return metadata
 
     def forward_update_meta_only(self, *args, **kwargs):
@@ -608,12 +603,7 @@ class HpuModelAdapter(torch.nn.Module):
                         self.interleaved_sliding_window, device, dtype)
         else:
             attn_metadata = self._set_block_mapping(attn_metadata, batch_size,
-                                                    device, dtype, False)
-        if hasattr(attn_metadata, 'window_block_list'
-                   ) and attn_metadata.window_block_list is not None:
-
-            attn_metadata = self._set_block_mapping(attn_metadata, batch_size,
-                                                    device, dtype, True)
+                                                    device, dtype)
         return attn_metadata
 
     def compute_input_embeddings_for_mm_optimized(self, warmup_mode, **kwargs):
@@ -1987,17 +1977,11 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         if self.interleaved_sliding_window is not None:
             window_block_groups = [[i] * len(bt)
                                    for i, bt in enumerate(window_block_tables)]
-            window_block_usage = [
-                [self.block_size] * (len(bt) - 1) + [lbu]
-                for bt, lbu in zip(block_tables, last_block_usage) if bt
-            ]
-
-            window_block_list = flatten(window_block_tables)
             window_block_groups = flatten(window_block_groups)
-            window_block_usage = flatten(window_block_usage)
+            window_block_list = flatten(window_block_tables)
 
             assert len(window_block_list) == len(window_block_groups)
-            assert len(window_block_list) == len(window_block_list)
+
         else:
             window_block_list = None
             window_block_groups = None
@@ -2070,15 +2054,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         block_usage = padding_fn(block_usage, 1)
 
         if self.interleaved_sliding_window is not None:
-            window_block_list = window_padding_fn(window_block_list,
-                                                  _PAD_BLOCK_ID)
             window_block_groups = window_padding_fn(window_block_groups, -1)
-            #window_block_usage = window_padding_fn(window_block_usage, 1)
-            window_block_usage = [
-                [1] if i == 0 else [block_usage[idx]]
-                for idx, (i,
-                          j) in enumerate(zip(window_block_list, block_usage))
-            ]
 
         if is_enc_dec_model:
             if self.use_contiguous_pa:
@@ -2178,21 +2154,11 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                     self.device, non_blocking=True)
 
         if self.interleaved_sliding_window is not None:
-            window_block_list = torch.tensor(window_block_list,
-                                             dtype=torch.int,
-                                             device='cpu')
+
             window_block_groups = torch.tensor(window_block_groups,
                                                dtype=torch.int,
                                                device='cpu')
-            window_block_usage = torch.tensor(window_block_usage,
-                                              dtype=self.model_config.dtype,
-                                              device='cpu')
-
-            window_block_list = window_block_list.to(  # type: ignore
-                self.device, non_blocking=True)
             window_block_groups = window_block_groups.to(  # type: ignore
-                self.device, non_blocking=True)
-            window_block_usage = window_block_usage.to(  # type: ignore
                 self.device, non_blocking=True)
 
         attn_metadata = self.attn_backend.make_metadata(
@@ -2202,9 +2168,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             block_mapping=None,
             block_usage=block_usage,
             block_groups=block_groups,
-            window_block_list=window_block_list,
             window_block_mapping=None,
-            window_block_usage=window_block_usage,
             window_block_groups=window_block_groups,
             attn_bias=None,
             seq_lens_tensor=None,
@@ -2650,9 +2614,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             'block_groups',
             'input_positions',
             'alibi_blocks',
-            'window_block_list',
             'window_block_mapping',
-            'window_block_usage',
             'window_block_groups',
             'window_attn_bias',
             'use_window_sdpa',
