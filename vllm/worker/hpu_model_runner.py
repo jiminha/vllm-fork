@@ -508,15 +508,9 @@ class HpuModelAdapter(torch.nn.Module):
         attn_bias = (torch.zeros_like(mask, dtype=dtype).masked_fill_(
             mask, -math.inf))
 
-        window_block_mapping = None
         if not is_fake_hpu():
             block_mapping = torch.nn.functional.one_hot(block_groups,
                                                         num_classes=batch_size)
-            if hasattr(metadata, 'window_block_groups'
-                ) and metadata.window_block_groups is not None:
-                window_block_mapping = torch.nn.functional.one_hot(
-                    metadata.window_block_groups, num_classes=batch_size)
-
         else:
             # Unfortunately one_hot on CPU
             # doesn't handle out of bounds classes so we need to convert
@@ -529,11 +523,26 @@ class HpuModelAdapter(torch.nn.Module):
             block_mapping.masked_fill_(oob_values.unsqueeze(-1), 0)
             block_groups.masked_fill_(oob_values, batch_size)
 
-            if hasattr(attn_metadata, 'window_block_groups'
-                ) and attn_metadata.window_block_groups is not None:
-                # Reset entire rows where window_block_groups is -1
-                window_block_mapping = block_mapping.clone()
-                window_block_mapping[metadata.window_block_groups == -1] = 0
+        if hasattr(metadata, 'window_block_groups'
+            ) and metadata.window_block_groups is not None:
+            #window_block_mapping = block_mapping.clone()
+            #window_block_mapping[metadata.window_block_groups == -1] = 0
+            #print("")
+            #print(f"block_mapping { block_mapping.shape}, window_block_groups {metadata.window_block_groups.shape}")
+            condition = (metadata.window_block_groups == -1).unsqueeze(1)
+            window_block_mapping = torch.where(condition == -1, torch.tensor(0, dtype=block_mapping.dtype), block_mapping)
+            #window_block_mapping = torch.nn.functional.one_hot(metadata.window_block_groups,
+            #                                            num_classes=batch_size)
+            #print(f"attn_bias { attn_bias.shape}, window_block_groups {metadata.window_block_groups.shape}")
+            #window_attn_bias = attn_bias.clone()
+            #window_attn_bias[metadata.window_block_groups == -1] = 0
+
+            window_attn_bias = torch.where(condition == -1, torch.tensor(0, dtype=attn_bias.dtype), attn_bias)
+  
+
+        else:
+            window_block_mapping = None
+            window_attn_bias = None
 
         block_mapping = block_mapping.to(dtype)
         window_block_mapping = window_block_mapping.to(dtype)
@@ -542,7 +551,8 @@ class HpuModelAdapter(torch.nn.Module):
                                         block_groups=block_groups,
                                         block_mapping=block_mapping,
                                         attn_bias=attn_bias,
-                                        window_block_mapping=window_block_mapping)
+                                        window_block_mapping=window_block_mapping,
+                                        window_attn_bias=window_attn_bias)
         return metadata
 
     def forward_update_meta_only(self, *args, **kwargs):
@@ -2170,6 +2180,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             block_groups=block_groups,
             window_block_mapping=None,
             window_block_groups=window_block_groups,
+            window_attn_bias=None,
             attn_bias=None,
             seq_lens_tensor=None,
             encoder_seq_lens=encoder_seq_lens,
